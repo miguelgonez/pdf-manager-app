@@ -5,6 +5,8 @@ from datetime import datetime
 from openai import OpenAI
 import io
 import os
+import base64
+from pdf2image import convert_from_bytes
 
 # Configuración de la página
 st.set_page_config(
@@ -56,8 +58,12 @@ if st.sidebar.button("🚪 Cerrar Sesión"):
 
 st.sidebar.markdown("---")
 
-# Inicializar cliente OpenAI
-client = OpenAI()
+# Inicializar clientes de API
+client_openai = OpenAI()
+client_deepseek = OpenAI(
+    api_key=st.secrets.get("DEEPSEEK_API_KEY", ""),
+    base_url="https://api.deepseek.com"
+)
 
 # Función para inicializar la base de datos
 def init_db():
@@ -77,6 +83,88 @@ def init_db():
     conn.commit()
     conn.close()
 
+# Función para convertir PDF a imágenes y luego a base64
+def pdf_to_base64_images(pdf_bytes, max_pages=3):
+    """Convierte las primeras páginas del PDF a imágenes base64"""
+    try:
+        images = convert_from_bytes(pdf_bytes, first_page=1, last_page=max_pages)
+        base64_images = []
+        
+        for img in images:
+            buffered = io.BytesIO()
+            img.save(buffered, format="PNG")
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+            base64_images.append(img_str)
+        
+        return base64_images
+    except Exception as e:
+        st.error(f"Error al convertir PDF a imágenes: {str(e)}")
+        return []
+
+# Función para extraer título y año usando DeepSeek OCR
+def extraer_metadata_con_ocr(pdf_bytes):
+    """Usa DeepSeek para extraer título y año del PDF mediante OCR"""
+    try:
+        # Convertir primera página a imagen base64
+        base64_images = pdf_to_base64_images(pdf_bytes, max_pages=1)
+        
+        if not base64_images:
+            return None, None
+        
+        # Crear mensaje con la imagen
+        response = client_deepseek.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Eres un asistente experto en análisis de documentos. Tu tarea es extraer el título y el año de publicación de documentos PDF. Responde ÚNICAMENTE en formato JSON con las claves 'titulo' y 'anio'. Si no encuentras el año, usa el año actual."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Analiza esta imagen de la primera página de un documento PDF y extrae:\n1. El título del documento (el texto más prominente, generalmente al inicio)\n2. El año de publicación (busca fechas, años, etc.)\n\nResponde en formato JSON: {\"titulo\": \"...\", \"anio\": 2024}"
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{base64_images[0]}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            temperature=0.3,
+            max_tokens=500
+        )
+        
+        # Extraer respuesta
+        respuesta = response.choices[0].message.content
+        
+        # Intentar parsear JSON
+        import json
+        try:
+            datos = json.loads(respuesta)
+            titulo = datos.get("titulo", "Documento sin título")
+            anio = datos.get("anio", datetime.now().year)
+            
+            # Validar año
+            if isinstance(anio, str):
+                anio = int(anio)
+            if anio < 1900 or anio > 2100:
+                anio = datetime.now().year
+            
+            return titulo, anio
+        except:
+            # Si no es JSON válido, intentar extraer manualmente
+            st.warning("No se pudo parsear la respuesta del OCR. Usando valores por defecto.")
+            return "Documento sin título", datetime.now().year
+            
+    except Exception as e:
+        st.error(f"Error en OCR con DeepSeek: {str(e)}")
+        return None, None
+
 # Función para extraer texto del PDF
 def extraer_texto_pdf(archivo_pdf):
     try:
@@ -92,7 +180,7 @@ def extraer_texto_pdf(archivo_pdf):
 # Función para generar resumen usando IA
 def generar_resumen(texto, max_palabras=300):
     try:
-        response = client.chat.completions.create(
+        response = client_openai.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": "Eres un asistente especializado en crear resúmenes concisos y precisos de documentos académicos y legales."},
@@ -176,54 +264,57 @@ menu = st.sidebar.selectbox(
 # SECCIÓN: Subir Documento
 if menu == "📤 Subir Documento":
     st.header("Subir Nuevo Documento PDF")
+    st.info("📄 El sistema extraerá automáticamente el título y año del documento usando OCR con IA")
     
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        archivo_pdf = st.file_uploader("Selecciona un archivo PDF", type=['pdf'])
-    
-    with col2:
-        anio = st.number_input("Año del documento", min_value=1900, max_value=2100, value=datetime.now().year)
-    
-    titulo = st.text_input("Título del documento (opcional)")
+    archivo_pdf = st.file_uploader("Selecciona un archivo PDF", type=['pdf'])
     
     if st.button("Procesar Documento", type="primary"):
         if archivo_pdf is not None:
             with st.spinner("Procesando documento..."):
-                # Extraer texto
-                st.info("Extrayendo texto del PDF...")
-                texto = extraer_texto_pdf(archivo_pdf)
+                # Leer bytes del PDF
+                pdf_bytes = archivo_pdf.read()
                 
-                if texto:
-                    # Generar título si no se proporcionó
-                    if not titulo:
-                        titulo = archivo_pdf.name.replace('.pdf', '')
+                # Extraer título y año con OCR
+                st.info("🔍 Extrayendo título y año con OCR...")
+                titulo, anio = extraer_metadata_con_ocr(pdf_bytes)
+                
+                if titulo and anio:
+                    st.success(f"✅ Título detectado: **{titulo}**")
+                    st.success(f"✅ Año detectado: **{anio}**")
                     
-                    # Generar referencia
-                    numero = obtener_siguiente_numero(anio)
-                    referencia = f"Art. {anio}{numero:04d}"
+                    # Extraer texto completo
+                    st.info("📝 Extrayendo texto completo del PDF...")
+                    archivo_pdf.seek(0)  # Resetear el puntero del archivo
+                    texto = extraer_texto_pdf(archivo_pdf)
                     
-                    # Generar resumen
-                    st.info("Generando resumen con IA...")
-                    resumen = generar_resumen(texto, 300)
-                    
-                    if resumen:
-                        # Insertar en la base de datos
-                        if insertar_documento(referencia, titulo, anio, resumen, texto):
-                            st.success(f"✅ Documento procesado exitosamente!")
-                            st.success(f"**Referencia asignada:** {referencia}")
-                            
-                            # Mostrar vista previa
-                            st.subheader("Vista Previa")
-                            st.write(f"**Título:** {titulo}")
-                            st.write(f"**Año:** {anio}")
-                            st.write(f"**Referencia:** {referencia}")
-                            st.write(f"**Resumen:**")
-                            st.write(resumen)
-                        else:
-                            st.error("No se pudo guardar el documento en la base de datos.")
+                    if texto:
+                        # Generar referencia
+                        numero = obtener_siguiente_numero(anio)
+                        referencia = f"Art. {anio}{numero:04d}"
+                        
+                        # Generar resumen
+                        st.info("🤖 Generando resumen con IA...")
+                        resumen = generar_resumen(texto, 300)
+                        
+                        if resumen:
+                            # Insertar en la base de datos
+                            if insertar_documento(referencia, titulo, anio, resumen, texto):
+                                st.success(f"✅ Documento procesado exitosamente!")
+                                st.success(f"**Referencia asignada:** {referencia}")
+                                
+                                # Mostrar vista previa
+                                st.subheader("Vista Previa")
+                                st.write(f"**Título:** {titulo}")
+                                st.write(f"**Año:** {anio}")
+                                st.write(f"**Referencia:** {referencia}")
+                                st.write(f"**Resumen:**")
+                                st.write(resumen)
+                            else:
+                                st.error("No se pudo guardar el documento en la base de datos.")
+                    else:
+                        st.error("No se pudo extraer texto del PDF.")
                 else:
-                    st.error("No se pudo extraer texto del PDF.")
+                    st.error("No se pudo extraer el título y año del documento.")
         else:
             st.warning("Por favor, selecciona un archivo PDF.")
 
@@ -325,4 +416,4 @@ elif menu == "🔍 Buscar Documento":
 
 # Pie de página
 st.sidebar.markdown("---")
-st.sidebar.info("💡 **Tip:** Los resúmenes se generan automáticamente usando IA.")
+st.sidebar.info("💡 **Tip:** El título y año se extraen automáticamente con OCR usando IA.")
