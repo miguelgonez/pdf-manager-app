@@ -13,6 +13,49 @@ st.set_page_config(
     layout="wide"
 )
 
+# Sistema de autenticación simple con Google
+def check_authentication():
+    """Verifica si el usuario está autenticado"""
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+    
+    if not st.session_state.authenticated:
+        st.title("🔐 Acceso Restringido")
+        st.markdown("---")
+        st.info("Esta aplicación requiere autenticación. Por favor, ingresa tu email autorizado.")
+        
+        # Obtener emails autorizados desde secrets
+        authorized_emails = []
+        if "AUTHORIZED_EMAILS" in st.secrets:
+            authorized_emails = [email.strip() for email in st.secrets["AUTHORIZED_EMAILS"].split(",")]
+        
+        email = st.text_input("Email", key="login_email")
+        
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if st.button("Ingresar", type="primary"):
+                if email in authorized_emails:
+                    st.session_state.authenticated = True
+                    st.session_state.user_email = email
+                    st.rerun()
+                else:
+                    st.error("❌ Email no autorizado. Contacta al administrador.")
+        
+        st.markdown("---")
+        st.caption("💡 Solo usuarios autorizados pueden acceder a esta aplicación.")
+        st.stop()
+
+# Verificar autenticación antes de mostrar la app
+check_authentication()
+
+# Mostrar usuario autenticado en el sidebar
+st.sidebar.success(f"✅ Autenticado como: {st.session_state.user_email}")
+if st.sidebar.button("🚪 Cerrar Sesión"):
+    st.session_state.authenticated = False
+    st.rerun()
+
+st.sidebar.markdown("---")
+
 # Inicializar cliente OpenAI
 client = OpenAI()
 
