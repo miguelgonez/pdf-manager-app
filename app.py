@@ -58,12 +58,8 @@ if st.sidebar.button("🚪 Cerrar Sesión"):
 
 st.sidebar.markdown("---")
 
-# Inicializar clientes de API
+# Inicializar cliente de API
 client_openai = OpenAI()
-client_deepseek = OpenAI(
-    api_key=st.secrets.get("DEEPSEEK_API_KEY", ""),
-    base_url="https://api.deepseek.com"
-)
 
 # Función para inicializar la base de datos
 def init_db():
@@ -102,8 +98,8 @@ def extraer_metadata_con_ia(texto):
         # Tomar solo las primeras 2000 caracteres para analizar
         texto_inicial = texto[:2000]
         
-        response = client_deepseek.chat.completions.create(
-            model="deepseek-chat",
+        response = client_openai.chat.completions.create(
+            model="gpt-4.1-mini",
             messages=[
                 {
                     "role": "system",
