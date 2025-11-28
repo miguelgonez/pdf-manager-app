@@ -255,7 +255,7 @@ st.markdown("---")
 # Menú de navegación
 menu = st.sidebar.selectbox(
     "Navegación",
-    ["📤 Subir Documento", "📋 Ver Documentos", "🔍 Buscar Documento"]
+    ["📤 Subir Documento", "📦 Procesamiento en Bloque", "📋 Ver Documentos", "🔍 Buscar Documento"]
 )
 
 # SECCIÓN: Subir Documento
@@ -312,6 +312,107 @@ if menu == "📤 Subir Documento":
                     st.error("No se pudo extraer suficiente texto del PDF. El documento puede estar vacío o ser una imagen escaneada.")
         else:
             st.warning("Por favor, selecciona un archivo PDF.")
+
+# SECCIÓN: Procesamiento en Bloque
+elif menu == "📦 Procesamiento en Bloque":
+    st.header("Procesamiento en Bloque de PDFs")
+    st.info("📦 Sube múltiples archivos PDF para procesarlos automáticamente")
+    
+    archivos_pdf = st.file_uploader(
+        "Selecciona uno o más archivos PDF",
+        type=['pdf'],
+        accept_multiple_files=True
+    )
+    
+    if archivos_pdf:
+        st.write(f"📄 **Archivos seleccionados:** {len(archivos_pdf)}")
+        
+        # Mostrar lista de archivos
+        with st.expander("Ver lista de archivos"):
+            for i, archivo in enumerate(archivos_pdf, 1):
+                st.write(f"{i}. {archivo.name}")
+        
+        if st.button("Procesar Todos los Documentos", type="primary"):
+            # Barra de progreso
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            # Contenedor para resultados
+            resultados_container = st.container()
+            
+            exitosos = 0
+            fallidos = 0
+            
+            for i, archivo_pdf in enumerate(archivos_pdf):
+                # Actualizar progreso
+                progreso = (i) / len(archivos_pdf)
+                progress_bar.progress(progreso)
+                status_text.text(f"Procesando {i+1}/{len(archivos_pdf)}: {archivo_pdf.name}")
+                
+                try:
+                    with resultados_container:
+                        with st.expander(f"📄 {archivo_pdf.name}", expanded=False):
+                            # Extraer texto
+                            st.write("📝 Extrayendo texto...")
+                            texto = extraer_texto_pdf(archivo_pdf)
+                            
+                            if texto and len(texto.strip()) > 50:
+                                # Extraer título y año
+                                st.write("🤖 Extrayendo título y año...")
+                                titulo, anio = extraer_metadata_con_ia(texto)
+                                
+                                if titulo and anio:
+                                    st.write(f"✅ **Título:** {titulo}")
+                                    st.write(f"✅ **Año:** {anio}")
+                                    
+                                    # Generar referencia
+                                    numero = obtener_siguiente_numero(anio)
+                                    referencia = f"Art. {anio}{numero:04d}"
+                                    st.write(f"🏷️ **Referencia:** {referencia}")
+                                    
+                                    # Generar resumen
+                                    st.write("📋 Generando resumen...")
+                                    resumen = generar_resumen(texto, 300)
+                                    
+                                    if resumen:
+                                        # Insertar en la base de datos
+                                        if insertar_documento(referencia, titulo, anio, resumen, texto):
+                                            st.success(f"✅ Procesado exitosamente")
+                                            st.write(f"**Resumen:** {resumen[:200]}...")
+                                            exitosos += 1
+                                        else:
+                                            st.error("❌ Error al guardar en la base de datos")
+                                            fallidos += 1
+                                    else:
+                                        st.error("❌ No se pudo generar el resumen")
+                                        fallidos += 1
+                                else:
+                                    st.error("❌ No se pudo extraer título y año")
+                                    fallidos += 1
+                            else:
+                                st.error("❌ Texto insuficiente en el PDF")
+                                fallidos += 1
+                                
+                except Exception as e:
+                    with resultados_container:
+                        with st.expander(f"❌ {archivo_pdf.name}", expanded=False):
+                            st.error(f"Error: {str(e)}")
+                    fallidos += 1
+            
+            # Completar progreso
+            progress_bar.progress(1.0)
+            status_text.text("✅ Procesamiento completado")
+            
+            # Mostrar resumen final
+            st.markdown("---")
+            st.subheader("📊 Resumen del Procesamiento")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total", len(archivos_pdf))
+            with col2:
+                st.metric("Exitosos", exitosos)
+            with col3:
+                st.metric("Fallidos", fallidos)
 
 # SECCIÓN: Ver Documentos
 elif menu == "📋 Ver Documentos":
