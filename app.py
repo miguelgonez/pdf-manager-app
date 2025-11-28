@@ -8,6 +8,19 @@ import os
 import json
 import re
 
+# Imports para RAG
+import chromadb
+from chromadb.config import Settings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain.schema import Document
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.schema.output_parser import StrOutputParser
+from typing import TypedDict, Annotated
+from langgraph.graph import StateGraph, END
+import operator
+
 # Configuración de la página
 st.set_page_config(
     page_title="Gestor de PDFs con Referencias",
@@ -60,6 +73,219 @@ st.sidebar.markdown("---")
 
 # Inicializar cliente de API
 client_openai = OpenAI()
+
+# Inicializar ChromaDB para RAG
+@st.cache_resource
+def init_chromadb():
+    """Inicializa ChromaDB para almacenamiento vectorial"""
+    client = chromadb.PersistentClient(path="./chroma_db")
+    collection = client.get_or_create_collection(
+        name="documentos_pdf",
+        metadata={"hnsw:space": "cosine"}
+    )
+    return client, collection
+
+# Inicializar embeddings de OpenAI
+@st.cache_resource
+def init_embeddings():
+    """Inicializa el modelo de embeddings de OpenAI"""
+    return OpenAIEmbeddings(model="text-embedding-3-small")
+
+# Inicializar LLM para RAG
+@st.cache_resource
+def init_llm():
+    """Inicializa el modelo de lenguaje para RAG"""
+    return ChatOpenAI(model="gpt-4.1-mini", temperature=0)
+
+chroma_client, chroma_collection = init_chromadb()
+embeddings_model = init_embeddings()
+llm_rag = init_llm()
+
+# Función para añadir documento a ChromaDB
+def add_documento_to_vectordb(referencia, titulo, anio, texto_completo, resumen):
+    """Añade un documento a ChromaDB evitando duplicados"""
+    try:
+        # Verificar si ya existe
+        existing = chroma_collection.get(ids=[referencia])
+        if existing['ids']:
+            return False  # Ya existe
+        
+        # Dividir texto en chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len
+        )
+        
+        # Crear documento completo para dividir
+        texto_completo_formateado = f"""Título: {titulo}
+Año: {anio}
+Referencia: {referencia}
+
+Resumen:
+{resumen}
+
+Texto completo:
+{texto_completo}"""
+        
+        chunks = text_splitter.split_text(texto_completo_formateado)
+        
+        # Generar embeddings para cada chunk
+        chunk_embeddings = embeddings_model.embed_documents(chunks)
+        
+        # Preparar IDs y metadatos
+        ids = [f"{referencia}_chunk_{i}" for i in range(len(chunks))]
+        metadatas = [
+            {
+                "referencia": referencia,
+                "titulo": titulo,
+                "anio": str(anio),
+                "chunk_index": i,
+                "total_chunks": len(chunks)
+            }
+            for i in range(len(chunks))
+        ]
+        
+        # Añadir a ChromaDB
+        chroma_collection.add(
+            ids=ids,
+            embeddings=chunk_embeddings,
+            documents=chunks,
+            metadatas=metadatas
+        )
+        
+        return True
+    except Exception as e:
+        st.error(f"Error al añadir a ChromaDB: {str(e)}")
+        return False
+
+# Función para sincronizar SQLite con ChromaDB
+def sync_sqlite_to_chromadb():
+    """Sincroniza todos los documentos de SQLite a ChromaDB"""
+    conn = sqlite3.connect('documentos.db')
+    c = conn.cursor()
+    c.execute('SELECT referencia, titulo, anio, resumen, texto_completo FROM documentos')
+    documentos = c.fetchall()
+    conn.close()
+    
+    sincronizados = 0
+    for doc in documentos:
+        referencia, titulo, anio, resumen, texto_completo = doc
+        if add_documento_to_vectordb(referencia, titulo, anio, texto_completo, resumen):
+            sincronizados += 1
+    
+    return sincronizados, len(documentos)
+
+# Estado para LangGraph
+class RAGState(TypedDict):
+    question: str
+    context: Annotated[list, operator.add]
+    answer: str
+    sources: list
+
+# Función para recuperar contexto relevante
+def retrieve_context(state: RAGState) -> RAGState:
+    """Recupera contexto relevante de ChromaDB"""
+    question = state["question"]
+    
+    # Generar embedding de la pregunta
+    question_embedding = embeddings_model.embed_query(question)
+    
+    # Buscar documentos similares
+    results = chroma_collection.query(
+        query_embeddings=[question_embedding],
+        n_results=5
+    )
+    
+    # Extraer contexto y fuentes
+    context = results['documents'][0] if results['documents'] else []
+    metadatas = results['metadatas'][0] if results['metadatas'] else []
+    
+    # Crear lista de fuentes únicas
+    sources = list(set([m['referencia'] for m in metadatas if 'referencia' in m]))
+    
+    return {
+        "question": question,
+        "context": context,
+        "answer": "",
+        "sources": sources
+    }
+
+# Función para generar respuesta
+def generate_answer(state: RAGState) -> RAGState:
+    """Genera respuesta basada en el contexto recuperado"""
+    question = state["question"]
+    context = state["context"]
+    
+    if not context:
+        return {
+            "question": question,
+            "context": context,
+            "answer": "No encontré información relevante en los documentos para responder a tu pregunta.",
+            "sources": []
+        }
+    
+    # Crear prompt
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", """Eres un asistente experto que responde preguntas basadas EXCLUSIVAMENTE en el contexto proporcionado.
+
+REGLAS ESTRICTAS:
+1. Solo usa información del contexto proporcionado
+2. Si la información no está en el contexto, di claramente que no la tienes
+3. NO inventes ni añadas información externa
+4. Cita las referencias cuando sea relevante
+5. Sé preciso y conciso
+
+Contexto:
+{context}"""),
+        ("human", "{question}")
+    ])
+    
+    # Formatear contexto
+    context_text = "\n\n".join(context)
+    
+    # Generar respuesta
+    chain = prompt_template | llm_rag | StrOutputParser()
+    answer = chain.invoke({"context": context_text, "question": question})
+    
+    return {
+        "question": question,
+        "context": context,
+        "answer": answer,
+        "sources": state["sources"]
+    }
+
+# Crear grafo de LangGraph
+def create_rag_graph():
+    """Crea el grafo de LangGraph para RAG"""
+    workflow = StateGraph(RAGState)
+    
+    # Añadir nodos
+    workflow.add_node("retrieve", retrieve_context)
+    workflow.add_node("generate", generate_answer)
+    
+    # Añadir edges
+    workflow.set_entry_point("retrieve")
+    workflow.add_edge("retrieve", "generate")
+    workflow.add_edge("generate", END)
+    
+    return workflow.compile()
+
+# Inicializar grafo RAG
+rag_graph = create_rag_graph()
+
+# Función para consultar RAG
+def query_rag(question: str):
+    """Consulta el sistema RAG con una pregunta"""
+    initial_state = {
+        "question": question,
+        "context": [],
+        "answer": "",
+        "sources": []
+    }
+    
+    result = rag_graph.invoke(initial_state)
+    return result
 
 # Función para inicializar la base de datos
 def init_db():
@@ -255,7 +481,7 @@ st.markdown("---")
 # Menú de navegación
 menu = st.sidebar.selectbox(
     "Navegación",
-    ["📤 Subir Documento", "📦 Procesamiento en Bloque", "📋 Ver Documentos", "🔍 Buscar Documento"]
+    ["📤 Subir Documento", "📦 Procesamiento en Bloque", "📋 Ver Documentos", "🔍 Buscar Documento", "🤖 Consulta RAG"]
 )
 
 # SECCIÓN: Subir Documento
@@ -292,6 +518,11 @@ if menu == "📤 Subir Documento":
                         if resumen:
                             # Insertar en la base de datos
                             if insertar_documento(referencia, titulo, anio, resumen, texto):
+                                # Añadir a ChromaDB para RAG
+                                st.info("📋 Añadiendo a base de datos vectorial...")
+                                if add_documento_to_vectordb(referencia, titulo, anio, texto, resumen):
+                                    st.success("✅ Añadido a ChromaDB para consultas RAG")
+                                
                                 st.success(f"✅ Documento procesado exitosamente!")
                                 st.success(f"**Referencia asignada:** {referencia}")
                                 
@@ -377,6 +608,8 @@ elif menu == "📦 Procesamiento en Bloque":
                                     if resumen:
                                         # Insertar en la base de datos
                                         if insertar_documento(referencia, titulo, anio, resumen, texto):
+                                            # Añadir a ChromaDB
+                                            add_documento_to_vectordb(referencia, titulo, anio, texto, resumen)
                                             st.success(f"✅ Procesado exitosamente")
                                             st.write(f"**Resumen:** {resumen[:200]}...")
                                             exitosos += 1
@@ -509,6 +742,85 @@ elif menu == "🔍 Buscar Documento":
                         st.text_area("Texto Completo:", texto_completo, height=300)
     elif 'resultados' in locals():
         st.warning("No se encontraron resultados.")
+
+# SECCIÓN: Consulta RAG
+elif menu == "🤖 Consulta RAG":
+    st.header("🤖 Consulta Inteligente con RAG")
+    st.info("📚 Haz preguntas sobre todos los documentos almacenados. El sistema usará LangGraph y agentes de LangChain para responder sin alucinar.")
+    
+    # Botón para sincronizar
+    col1, col2 = st.columns([3, 1])
+    with col2:
+        if st.button("🔄 Sincronizar BD"):
+            with st.spinner("Sincronizando documentos..."):
+                sincronizados, total = sync_sqlite_to_chromadb()
+                st.success(f"✅ {sincronizados} documentos nuevos sincronizados de {total} totales")
+    
+    # Mostrar estadísticas de ChromaDB
+    try:
+        total_docs = chroma_collection.count()
+        st.metric("📊 Documentos en ChromaDB", total_docs)
+    except:
+        st.warning("⚠️ No se pudo obtener el conteo de documentos")
+    
+    st.markdown("---")
+    
+    # Historial de chat
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+    
+    # Mostrar historial
+    for i, chat in enumerate(st.session_state.chat_history):
+        with st.chat_message("user"):
+            st.write(chat['question'])
+        with st.chat_message("assistant"):
+            st.write(chat['answer'])
+            if chat['sources']:
+                st.caption(f"📚 **Fuentes:** {', '.join(chat['sources'])}")
+    
+    # Input de pregunta
+    question = st.chat_input("💬 Haz una pregunta sobre los documentos...")
+    
+    if question:
+        # Mostrar pregunta del usuario
+        with st.chat_message("user"):
+            st.write(question)
+        
+        # Procesar con RAG
+        with st.chat_message("assistant"):
+            with st.spinner("🤔 Buscando en los documentos..."):
+                try:
+                    result = query_rag(question)
+                    
+                    # Mostrar respuesta
+                    st.write(result['answer'])
+                    
+                    # Mostrar fuentes
+                    if result['sources']:
+                        st.caption(f"📚 **Fuentes consultadas:** {', '.join(result['sources'])}")
+                        
+                        # Mostrar contexto usado (opcional, en expander)
+                        with st.expander("🔍 Ver contexto utilizado"):
+                            for i, ctx in enumerate(result['context'][:3], 1):
+                                st.text_area(f"Fragmento {i}", ctx, height=100, key=f"ctx_{i}")
+                    else:
+                        st.warning("⚠️ No se encontraron documentos relevantes")
+                    
+                    # Guardar en historial
+                    st.session_state.chat_history.append({
+                        'question': question,
+                        'answer': result['answer'],
+                        'sources': result['sources']
+                    })
+                    
+                except Exception as e:
+                    st.error(f"❌ Error al procesar la consulta: {str(e)}")
+    
+    # Botón para limpiar historial
+    if st.session_state.chat_history:
+        if st.button("🗑️ Limpiar historial"):
+            st.session_state.chat_history = []
+            st.rerun()
 
 # Pie de página
 st.sidebar.markdown("---")
