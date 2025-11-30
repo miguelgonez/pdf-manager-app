@@ -299,9 +299,21 @@ def init_db():
             anio INTEGER NOT NULL,
             resumen TEXT NOT NULL,
             texto_completo TEXT,
+            categoria TEXT,
+            tags TEXT,
             fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
+    # Agregar columnas si no existen (para bases de datos existentes)
+    try:
+        c.execute('ALTER TABLE documentos ADD COLUMN categoria TEXT')
+    except:
+        pass
+    try:
+        c.execute('ALTER TABLE documentos ADD COLUMN tags TEXT')
+    except:
+        pass
     conn.commit()
     conn.close()
 
@@ -417,6 +429,72 @@ def generar_resumen(texto, max_palabras=300):
         st.error(f"Error al generar resumen: {str(e)}")
         return None
 
+# Función para extraer categoría y tags usando IA
+def extraer_categoria_y_tags(texto, titulo, resumen):
+    """Extrae la categoría (Nano/Micro/Meso/Macro) y tags temáticos del documento"""
+    try:
+        # Combinar información relevante
+        texto_analisis = f"""Título: {titulo}
+
+Resumen: {resumen}
+
+Texto completo (primeros 3000 caracteres):
+{texto[:3000]}"""
+        
+        response = client_openai.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """Eres un experto en clasificación de documentos sanitarios y de gestión de salud.
+Debes clasificar documentos según 4 niveles de intervención:
+
+- **Nano**: Dimensión del dato, biología computacional, genética, datos crudos, sensores, biología molecular, datos sintéticos, privacidad de datos, GDPR, HIPAA.
+- **Micro**: Interacción clínica, relación médico-paciente, empoderamiento del paciente, IA conversacional, copilotos clínicos, autocuidado, adherencia terapéutica.
+- **Meso**: Organización institucional, hospitales, centros de salud, hospital líquido, telemedicina, monitorización remota, gestión de recursos, interoperabilidad.
+- **Macro**: Gobernanza, política sanitaria, salud pública, ministerios de salud, asignación de presupuestos, gemelos digitales, simulación poblacional, ética algorítmica.
+
+Responde SOLO en formato JSON con:
+{{
+  "categoria": "Nano" | "Micro" | "Meso" | "Macro",
+  "tags": ["tag1", "tag2", "tag3", ...]
+}}
+
+Los tags deben ser palabras clave específicas del contenido (máximo 8 tags)."""
+                },
+                {
+                    "role": "user",
+                    "content": f"Clasifica el siguiente documento:\n\n{texto_analisis}"
+                }
+            ],
+            temperature=0.1,
+            max_tokens=300
+        )
+        
+        respuesta = response.choices[0].message.content.strip()
+        
+        # Parsear JSON
+        json_match = re.search(r'\{.*\}', respuesta, re.DOTALL)
+        if json_match:
+            respuesta = json_match.group()
+        
+        datos = json.loads(respuesta)
+        categoria = datos.get("categoria", "Micro")  # Default a Micro
+        tags = datos.get("tags", [])
+        
+        # Validar categoría
+        if categoria not in ["Nano", "Micro", "Meso", "Macro"]:
+            categoria = "Micro"
+        
+        # Convertir tags a string separado por comas
+        tags_str = ", ".join(tags[:8])  # Máximo 8 tags
+        
+        return categoria, tags_str
+        
+    except Exception as e:
+        st.warning(f"Error al extraer categoría y tags: {str(e)}")
+        return "Micro", ""  # Default
+
 # Función para obtener el siguiente número de artículo
 def obtener_siguiente_numero(anio):
     conn = sqlite3.connect('documentos.db')
@@ -427,14 +505,14 @@ def obtener_siguiente_numero(anio):
     return count + 1
 
 # Función para insertar documento en la base de datos
-def insertar_documento(referencia, titulo, anio, resumen, texto_completo):
+def insertar_documento(referencia, titulo, anio, resumen, texto_completo, categoria="Micro", tags=""):
     try:
         conn = sqlite3.connect('documentos.db')
         c = conn.cursor()
         c.execute('''
-            INSERT INTO documentos (referencia, titulo, anio, resumen, texto_completo)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (referencia, titulo, anio, resumen, texto_completo))
+            INSERT INTO documentos (referencia, titulo, anio, resumen, texto_completo, categoria, tags)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (referencia, titulo, anio, resumen, texto_completo, categoria, tags))
         conn.commit()
         conn.close()
         return True
@@ -481,7 +559,7 @@ st.markdown("---")
 # Menú de navegación
 menu = st.sidebar.selectbox(
     "Navegación",
-    ["📤 Subir Documento", "📦 Procesamiento en Bloque", "📋 Ver Documentos", "🔍 Buscar Documento", "🤖 Consulta RAG"]
+    ["📤 Subir Documento", "📦 Procesamiento en Bloque", "📋 Ver Documentos", "🔍 Buscar Documento", "🔎 Búsqueda Avanzada", "🤖 Consulta RAG"]
 )
 
 # SECCIÓN: Subir Documento
@@ -516,8 +594,15 @@ if menu == "📤 Subir Documento":
                         resumen = generar_resumen(texto, 300)
                         
                         if resumen:
+                            # Extraer categoría y tags
+                            st.info("🏷️ Clasificando documento y extrayendo tags...")
+                            categoria, tags = extraer_categoria_y_tags(texto, titulo, resumen)
+                            st.success(f"✅ Categoría: **{categoria}**")
+                            if tags:
+                                st.success(f"🏷️ Tags: {tags}")
+                            
                             # Insertar en la base de datos
-                            if insertar_documento(referencia, titulo, anio, resumen, texto):
+                            if insertar_documento(referencia, titulo, anio, resumen, texto, categoria, tags):
                                 # Añadir a ChromaDB para RAG
                                 st.info("📋 Añadiendo a base de datos vectorial...")
                                 if add_documento_to_vectordb(referencia, titulo, anio, texto, resumen):
@@ -606,8 +691,12 @@ elif menu == "📦 Procesamiento en Bloque":
                                     resumen = generar_resumen(texto, 300)
                                     
                                     if resumen:
+                                        # Extraer categoría y tags
+                                        categoria, tags = extraer_categoria_y_tags(texto, titulo, resumen)
+                                        st.write(f"🏷️ **Categoría:** {categoria}")
+                                        
                                         # Insertar en la base de datos
-                                        if insertar_documento(referencia, titulo, anio, resumen, texto):
+                                        if insertar_documento(referencia, titulo, anio, resumen, texto, categoria, tags):
                                             # Añadir a ChromaDB
                                             add_documento_to_vectordb(referencia, titulo, anio, texto, resumen)
                                             st.success(f"✅ Procesado exitosamente")
@@ -742,6 +831,203 @@ elif menu == "🔍 Buscar Documento":
                         st.text_area("Texto Completo:", texto_completo, height=300)
     elif 'resultados' in locals():
         st.warning("No se encontraron resultados.")
+
+# SECCIÓN: Búsqueda Avanzada
+elif menu == "🔎 Búsqueda Avanzada":
+    st.header("🔎 Búsqueda Avanzada por Categorías y Tags")
+    st.info("🏷️ Filtra documentos por categoría temática y tags específicos")
+    
+    # Explicación de las categorías
+    with st.expander("📚 ¿Qué significa cada categoría?"):
+        st.markdown("""
+        ### Los Cuatro Niveles de Intervención
+        
+        **🔬 Nano**: Dimensión del dato y biología computacional
+        - Biología molecular, genética, datos crudos
+        - Sensores, secuenciadores, registros electrónicos
+        - Datos sintéticos, privacidad (GDPR, HIPAA)
+        - Inferencia y detección presintomática
+        
+        **👥 Micro**: Interacción clínica y empoderamiento
+        - Relación médico-paciente
+        - IA conversacional, copilotos clínicos
+        - Autocuidado y adherencia terapéutica
+        - Empoderamiento del paciente
+        
+        **🏥 Meso**: Organización y "Hospital Líquido"
+        - Gestión de instituciones y redes
+        - Hospitales, centros de salud, aseguradoras
+        - Telemedicina y monitorización remota
+        - Interoperabilidad y continuidad de cuidados
+        
+        **🌍 Macro**: Gobernanza, política y población
+        - Ministerios de salud, organismos internacionales
+        - Estrategias de salud pública
+        - Gemelos digitales de poblaciones
+        - Ética algorítmica y gobernanza del dato
+        """)
+    
+    st.markdown("---")
+    
+    # Obtener todas las categorías y tags disponibles
+    conn = sqlite3.connect('documentos.db')
+    c = conn.cursor()
+    
+    # Obtener categorías únicas
+    c.execute('SELECT DISTINCT categoria FROM documentos WHERE categoria IS NOT NULL')
+    categorias_disponibles = [row[0] for row in c.fetchall()]
+    
+    # Obtener todos los tags
+    c.execute('SELECT tags FROM documentos WHERE tags IS NOT NULL AND tags != ""')
+    todos_tags = []
+    for row in c.fetchall():
+        if row[0]:
+            todos_tags.extend([tag.strip() for tag in row[0].split(',')])
+    tags_unicos = sorted(list(set(todos_tags)))
+    
+    conn.close()
+    
+    # Filtros
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("🏷️ Filtrar por Categoría")
+        categorias_seleccionadas = st.multiselect(
+            "Selecciona una o más categorías",
+            options=["Nano", "Micro", "Meso", "Macro"],
+            default=None
+        )
+    
+    with col2:
+        st.subheader("🔖 Filtrar por Tags")
+        if tags_unicos:
+            tags_seleccionados = st.multiselect(
+                "Selecciona uno o más tags",
+                options=tags_unicos,
+                default=None
+            )
+        else:
+            st.info("Aún no hay tags disponibles. Procesa algunos documentos primero.")
+            tags_seleccionados = []
+    
+    # Filtro de año
+    st.subheader("📅 Filtrar por Año")
+    col_anio1, col_anio2 = st.columns(2)
+    with col_anio1:
+        anio_desde = st.number_input("Desde", min_value=1900, max_value=2100, value=2020)
+    with col_anio2:
+        anio_hasta = st.number_input("Hasta", min_value=1900, max_value=2100, value=datetime.now().year)
+    
+    # Botón de búsqueda
+    if st.button("🔍 Buscar", type="primary"):
+        # Construir consulta SQL dinámica
+        conn = sqlite3.connect('documentos.db')
+        c = conn.cursor()
+        
+        query = "SELECT * FROM documentos WHERE 1=1"
+        params = []
+        
+        # Filtro de categoría
+        if categorias_seleccionadas:
+            placeholders = ','.join(['?' for _ in categorias_seleccionadas])
+            query += f" AND categoria IN ({placeholders})"
+            params.extend(categorias_seleccionadas)
+        
+        # Filtro de tags
+        if tags_seleccionados:
+            for tag in tags_seleccionados:
+                query += " AND tags LIKE ?"
+                params.append(f"%{tag}%")
+        
+        # Filtro de año
+        query += " AND anio >= ? AND anio <= ?"
+        params.extend([anio_desde, anio_hasta])
+        
+        query += " ORDER BY fecha_registro DESC"
+        
+        c.execute(query, params)
+        resultados = c.fetchall()
+        conn.close()
+        
+        # Mostrar resultados
+        if resultados:
+            st.success(f"✅ Se encontraron **{len(resultados)}** documento(s)")
+            st.markdown("---")
+            
+            # Estadísticas de resultados
+            categorias_count = {}
+            for doc in resultados:
+                cat = doc[6] if len(doc) > 6 and doc[6] else "Sin categoría"
+                categorias_count[cat] = categorias_count.get(cat, 0) + 1
+            
+            st.subheader("📊 Distribución por Categoría")
+            cols = st.columns(4)
+            for i, (cat, count) in enumerate(categorias_count.items()):
+                with cols[i % 4]:
+                    st.metric(cat, count)
+            
+            st.markdown("---")
+            
+            # Mostrar documentos
+            for doc in resultados:
+                if len(doc) >= 8:
+                    doc_id, referencia, titulo, anio, resumen, texto_completo, categoria, tags, fecha_registro = doc
+                else:
+                    doc_id, referencia, titulo, anio, resumen, texto_completo, fecha_registro = doc
+                    categoria = "Sin categoría"
+                    tags = ""
+                
+                # Emoji según categoría
+                emoji_cat = {
+                    "Nano": "🔬",
+                    "Micro": "👥",
+                    "Meso": "🏭",
+                    "Macro": "🌍"
+                }.get(categoria, "📚")
+                
+                with st.expander(f"{emoji_cat} **{referencia}** - {titulo}", expanded=False):
+                    col_info1, col_info2 = st.columns(2)
+                    with col_info1:
+                        st.write(f"**Título:** {titulo}")
+                        st.write(f"**Año:** {anio}")
+                        st.write(f"**Categoría:** {emoji_cat} {categoria}")
+                    with col_info2:
+                        st.write(f"**Referencia:** {referencia}")
+                        st.write(f"**Fecha de registro:** {fecha_registro}")
+                        if tags:
+                            st.write(f"**Tags:** {tags}")
+                    
+                    st.write(f"**Resumen:**")
+                    st.write(resumen)
+                    
+                    if st.button(f"Ver texto completo", key=f"avanzada_{doc_id}"):
+                        if texto_completo:
+                            st.text_area("Texto Completo:", texto_completo, height=300, key=f"texto_{doc_id}")
+        else:
+            st.warning("⚠️ No se encontraron documentos con los filtros seleccionados.")
+    
+    # Mostrar estadísticas generales
+    st.markdown("---")
+    st.subheader("📊 Estadísticas Generales")
+    
+    conn = sqlite3.connect('documentos.db')
+    c = conn.cursor()
+    
+    col_stats1, col_stats2, col_stats3, col_stats4 = st.columns(4)
+    
+    for i, cat in enumerate(["Nano", "Micro", "Meso", "Macro"]):
+        c.execute('SELECT COUNT(*) FROM documentos WHERE categoria = ?', (cat,))
+        count = c.fetchone()[0]
+        emoji = {
+            "Nano": "🔬",
+            "Micro": "👥",
+            "Meso": "🏭",
+            "Macro": "🌍"
+        }[cat]
+        with [col_stats1, col_stats2, col_stats3, col_stats4][i]:
+            st.metric(f"{emoji} {cat}", count)
+    
+    conn.close()
 
 # SECCIÓN: Consulta RAG
 elif menu == "🤖 Consulta RAG":
